@@ -58,10 +58,15 @@ def send_ssdp_discovery(search_target, retries, timeout, max_wait=SSDP_MX):
             f'HOST: {SSDP_ADDR}:{SSDP_PORT}\r\n'
             f'MAN: "ssdp:discover"\r\n'
             f'MX: {max_wait}\r\n'
+            # The search target is pasted into the request as raw text. A value carrying line
+            # breaks would write headers I never meant to send, and I do not check for that.
             f'ST: {search_target}\r\n'
             f'\r\n'
         )
 
+        # I fire every retry before anything starts listening in earnest. Replies to the first
+        # burst can arrive while I am still sleeping between sends, and only the socket
+        # buffer holds them until the receive loop starts.
         for i in range(retries):
             sock.sendto(ssdp_request.encode('utf-8'), (SSDP_ADDR, SSDP_PORT))
             logging.debug(f"SSDP Discovery message sent (attempt {i+1}/{retries}).")
@@ -156,6 +161,8 @@ def receive_ssdp_responses(sock, max_wait, verbose):
                         key, value = line.split(':', 1)
                         headers[key.strip().upper()] = value.strip()
 
+                # A response without LOCATION never becomes a result. I drop it with no log line,
+                # so a device that answers but sends thin headers stays invisible to me.
                 if 'LOCATION' in headers:
                     location = headers['LOCATION']
                     skip_reason = fetch_skip_reason(location, addr[0])
@@ -165,6 +172,8 @@ def receive_ssdp_responses(sock, max_wait, verbose):
                     else:
                         try:
                             # Fetch the device description from the location
+                            # This fetch runs inside my receive loop with its own 5 second timeout, so one
+                            # slow description can hold the loop open well past the max wait asked for.
                             device_description_response = requests.get(location, timeout=5) # Increased timeout
                             device_description_response.raise_for_status()  # Raise HTTPError for bad responses (4xx or 5xx)
                             device_description = device_description_response.text
@@ -182,6 +191,8 @@ def receive_ssdp_responses(sock, max_wait, verbose):
                         'device_description': device_description,
                         'location': location
                     }
+                    # I never dedupe on USN or LOCATION. A device that answers all three of my bursts
+                    # shows up once per answer, and I fetch its description again each time.
                     responses.append(response_data)
                     logging.info(f"Found device at {addr[0]}:{addr[1]} - ST: {headers.get('ST', 'N/A')} - Location: {location}")
 
